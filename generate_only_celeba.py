@@ -128,9 +128,14 @@ def build_train_transforms(input_size: int, enable_eot_aug: bool) -> torch.nn.Mo
     return utils.data.ElementWiseTransform(trans)
 
 
-def save_uint8_hwc_as_jpg(arr_hwc: np.ndarray, out_path: str, quality: int):
+def save_uint8_hwc_as_image(arr_hwc: np.ndarray, out_path: str, image_format: str):
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    Image.fromarray(arr_hwc).save(out_path, quality=quality)
+    if image_format == "png":
+        Image.fromarray(arr_hwc).save(out_path, format="PNG")
+    elif image_format == "jpg":
+        Image.fromarray(arr_hwc).save(out_path, format="JPEG", quality=100)
+    else:
+        raise ValueError(f"Unsupported image_format={image_format}")
 
 
 def atomic_save_torch(obj: dict, path: str):
@@ -245,8 +250,8 @@ def main():
     p.add_argument("--device", type=str, default="cuda:0")
     p.add_argument("--seed", type=int, default=0)
 
-    # Output fidelity
-    p.add_argument("--save-quality", type=int, default=100)
+    # Output format
+    p.add_argument("--image-format", type=str, default="png", choices=["png", "jpg"])
 
     # Checkpointing + JSONL logging
     p.add_argument("--save-freq", type=int, default=1000)
@@ -493,7 +498,8 @@ def main():
 
     # Write poisoned images + poison_map (atomic per-file write)
     poison_rows: List[List[str]] = []
-    for clean_path, _label, idx in tqdm(samples, desc="Write JPGs"):
+    write_desc = "Write PNGs" if args.image_format == "png" else "Write JPGs"
+    for clean_path, _label, idx in tqdm(samples, desc=write_desc):
         img = Image.open(clean_path).convert("RGB")
         img = img.resize((args.input_size, args.input_size), resample=Image.BILINEAR)
         arr = np.array(img, dtype=np.int16)
@@ -502,11 +508,12 @@ def main():
         noise_hwc = np.transpose(noise, (1, 2, 0))       # HWC
         poisoned = np.clip(arr + noise_hwc, 0, 255).astype(np.uint8)
 
-        fname = os.path.basename(clean_path)
+        ext = ".png" if args.image_format == "png" else ".jpg"
+        fname = os.path.splitext(os.path.basename(clean_path))[0] + ext
         poisoned_path = os.path.abspath(os.path.join(args.out_images_dir, fname))
 
         tmp_img = poisoned_path + ".tmp"
-        save_uint8_hwc_as_jpg(poisoned, tmp_img, quality=args.save_quality)
+        save_uint8_hwc_as_image(poisoned, tmp_img, image_format=args.image_format)
         os.replace(tmp_img, poisoned_path)
 
         poison_rows.append([clean_path, poisoned_path])
