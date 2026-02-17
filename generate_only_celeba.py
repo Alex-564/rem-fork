@@ -2,6 +2,7 @@ import argparse
 import csv
 import json
 import os
+import random
 import re
 import time
 from typing import Dict, List, Tuple, Optional
@@ -39,7 +40,7 @@ class CSVIndexedImageDataset(Dataset):
 
         # Base preprocessing: deterministic resize-only 
         self.base_tf = transforms.Compose([
-            transforms.Resize((input_size, input_size)),
+            transforms.Resize((input_size, input_size), interpolation=transforms.InterpolationMode.BILINEAR),
             transforms.ToTensor(),  # [0,1]
         ])
 
@@ -60,6 +61,7 @@ class EndlessLoader:
     def __init__(self, dl: DataLoader):
         self.dl = dl
         self.it = None
+        self.steps_consumed = 0
 
     def __len__(self):
         return len(self.dl)
@@ -68,10 +70,22 @@ class EndlessLoader:
         if self.it is None:
             self.it = iter(self.dl)
         try:
-            return next(self.it)
+            batch = next(self.it)
         except StopIteration:
             self.it = iter(self.dl)
-            return next(self.it)
+            batch = next(self.it)
+        self.steps_consumed += 1
+        return batch
+
+    def fast_forward(self, steps: int):
+        for _ in range(int(steps)):
+            _ = next(self)
+
+
+def seed_worker(worker_id: int) -> None:
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 # CelebA specific model builder 
@@ -131,7 +145,7 @@ def build_train_transforms(input_size: int, enable_eot_aug: bool) -> torch.nn.Mo
 def save_uint8_hwc_as_image(arr_hwc: np.ndarray, out_path: str, image_format: str):
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     if image_format == "png":
-        Image.fromarray(arr_hwc).save(out_path, format="PNG")
+        Image.fromarray(arr_hwc).save(out_path, format="PNG", compress_level=0)
     elif image_format == "jpg":
         Image.fromarray(arr_hwc).save(out_path, format="JPEG", quality=100)
     else:
@@ -264,8 +278,11 @@ def main():
     args = p.parse_args()
 
     # Determinism (reasonable baseline; REM itself doesn't fully freeze RNG because aug is stochastic by design)
+    random.seed(args.seed)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
     os.makedirs(args.out_images_dir, exist_ok=True)
     os.makedirs(os.path.dirname(args.out_poison_map), exist_ok=True)
@@ -299,6 +316,9 @@ def main():
 
     # Dataset + loader
     ds = CSVIndexedImageDataset(samples, input_size=args.input_size)
+    dl_gen = torch.Generator()
+    dl_gen.manual_seed(args.seed)
+
     dl = DataLoader(
         ds,
         batch_size=args.batch_size,
@@ -306,6 +326,8 @@ def main():
         drop_last=True,
         num_workers=args.num_workers,
         pin_memory=True,
+        worker_init_fn=seed_worker,
+        generator=dl_gen,
     )
     train_loader = EndlessLoader(dl)
 
@@ -371,6 +393,7 @@ def main():
             "next_step": int(next_step),
             "model": model.state_dict(),
             "optim": optim.state_dict(),
+            "py_rng": random.getstate(),
             "torch_rng": torch.random.get_rng_state(),
             "np_rng": np.random.get_state(),
             "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
@@ -386,6 +409,8 @@ def main():
         ckpt = torch.load(path, map_location="cpu")
         model.load_state_dict(ckpt["model"])
         optim.load_state_dict(ckpt["optim"])
+        if ckpt.get("py_rng") is not None:
+            random.setstate(ckpt["py_rng"])
         torch.random.set_rng_state(ckpt["torch_rng"])
         np.random.set_state(ckpt["np_rng"])
         if torch.cuda.is_available() and ckpt.get("cuda_rng") is not None:
@@ -418,6 +443,9 @@ def main():
             ckpt_path = args.resume
 
         start_step = load_checkpoint(ckpt_path)
+        if start_step > 0:
+            print(f"[REM] Fast-forwarding loader by {start_step} steps for deterministic resume...")
+            train_loader.fast_forward(start_step)
         print(f"[REM] Resumed from {ckpt_path} at next_step={start_step}")
 
     t0 = time.perf_counter()
@@ -499,6 +527,7 @@ def main():
     # Write poisoned images + poison_map (atomic per-file write)
     poison_rows: List[List[str]] = []
     write_desc = "Write PNGs" if args.image_format == "png" else "Write JPGs"
+
     for clean_path, _label, idx in tqdm(samples, desc=write_desc):
         img = Image.open(clean_path).convert("RGB")
         img = img.resize((args.input_size, args.input_size), resample=Image.BILINEAR)
