@@ -34,7 +34,7 @@ class CSVIndexedImageDataset(Dataset):
       ii: int64 tensor (stable)
       path: str (for later writing poison_map)
     """
-    def __init__(self, samples: List[Tuple[str, int, int]], input_size: int = 112):
+    def __init__(self, samples: List[Tuple[str, int, int, str]], input_size: int = 112):
         self.samples = samples
         self.input_size = input_size
 
@@ -48,11 +48,28 @@ class CSVIndexedImageDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, i: int):
-        path, label, idx = self.samples[i]
+        path, label, idx, _poisoned_rel_path = self.samples[i]
         img = Image.open(path).convert("RGB")
         x01 = self.base_tf(img)       # [0,1]
         x255 = x01 * 255.0            # [0,255]
         return x255, int(label), int(idx), path
+
+
+def resolve_poisoned_output_path(out_images_dir: str, clean_path: str, poisoned_rel_path: str, image_format: str) -> str:
+    ext = ".png" if image_format == "png" else ".jpg"
+    fallback_name = os.path.splitext(os.path.basename(clean_path))[0] + ext
+
+    rel = (poisoned_rel_path or "").strip()
+    if not rel:
+        rel = fallback_name
+    else:
+        rel = os.path.normpath(rel)
+        if os.path.isabs(rel):
+            raise RuntimeError(f"poisoned_rel_path must be relative, got absolute path: {poisoned_rel_path}")
+        if rel == ".." or rel.startswith(".." + os.sep):
+            raise RuntimeError(f"poisoned_rel_path escapes output directory: {poisoned_rel_path}")
+
+    return os.path.abspath(os.path.join(out_images_dir, rel))
 
 
 # Endless loader (step-based training like REM's Loader)
@@ -291,27 +308,28 @@ def main():
     os.makedirs(os.path.dirname(args.log_jsonl), exist_ok=True)
 
     # Read samples
-    samples: List[Tuple[str, int, int]] = []
+    samples: List[Tuple[str, int, int, str]] = []
     with open(args.samples_csv, "r", newline="") as f:
         r = csv.DictReader(f)
         for row in r:
             clean_path = os.path.abspath(row["clean_path"])
             label = int(row["label"])
             idx = int(row["idx"])
-            samples.append((clean_path, label, idx))
+            poisoned_rel_path = row.get("poisoned_rel_path", "")
+            samples.append((clean_path, label, idx, poisoned_rel_path))
 
     if not samples:
         raise RuntimeError("No samples found in samples_csv.")
 
     n = len(samples)
-    idxs = [ii for _, _, ii in samples]
+    idxs = [ii for _, _, ii, _ in samples]
     if sorted(idxs) != list(range(n)):
         raise RuntimeError(
             "samples_csv idx must be a permutation of 0..N-1 "
             f"(min={min(idxs)} max={max(idxs)} unique={len(set(idxs))} N={n})"
         )
 
-    labels = [y for _, y, _ in samples]
+    labels = [y for _, y, _, _ in samples]
     num_classes = max(labels) + 1
 
     # Dataset + loader
@@ -528,7 +546,8 @@ def main():
     poison_rows: List[List[str]] = []
     write_desc = "Write PNGs" if args.image_format == "png" else "Write JPGs"
 
-    for clean_path, _label, idx in tqdm(samples, desc=write_desc):
+    seen_poisoned_paths = set()
+    for clean_path, _label, idx, poisoned_rel_path in tqdm(samples, desc=write_desc):
         img = Image.open(clean_path).convert("RGB")
         img = img.resize((args.input_size, args.input_size), resample=Image.BILINEAR)
         arr = np.array(img, dtype=np.int16)
@@ -537,9 +556,21 @@ def main():
         noise_hwc = np.transpose(noise, (1, 2, 0))       # HWC
         poisoned = np.clip(arr + noise_hwc, 0, 255).astype(np.uint8)
 
-        ext = ".png" if args.image_format == "png" else ".jpg"
-        fname = os.path.splitext(os.path.basename(clean_path))[0] + ext
-        poisoned_path = os.path.abspath(os.path.join(args.out_images_dir, fname))
+        poisoned_path = resolve_poisoned_output_path(
+            out_images_dir=args.out_images_dir,
+            clean_path=clean_path,
+            poisoned_rel_path=poisoned_rel_path,
+            image_format=args.image_format,
+        )
+
+        if poisoned_path in seen_poisoned_paths:
+            raise RuntimeError(
+                f"Duplicate poisoned output path detected: {poisoned_path}. "
+                "Regenerate with unique per-sample relative paths."
+            )
+        seen_poisoned_paths.add(poisoned_path)
+
+        os.makedirs(os.path.dirname(poisoned_path), exist_ok=True)
 
         tmp_img = poisoned_path + ".tmp"
         save_uint8_hwc_as_image(poisoned, tmp_img, image_format=args.image_format)
