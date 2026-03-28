@@ -470,7 +470,14 @@ def main():
     last_def_acc = None
     last_def_loss = None
 
-    for step in range(start_step, args.train_steps):
+    for step in tqdm(
+        range(start_step, args.train_steps),
+        total=args.train_steps,
+        initial=start_step,
+        desc="REM train",
+        unit="step",
+        mininterval=0.5,
+    ):
         lr = args.lr * (args.lr_decay_rate ** (step // args.lr_decay_freq))
         for group in optim.param_groups:
             group["lr"] = lr
