@@ -601,10 +601,10 @@ def main():
     atomic_write_json(args.out_metrics_json, metrics)
 
     print(f"[REM] Saved poisoned images: {args.out_images_dir}")
-    print(f"[REM] Saved poison map:      {args.out_poison_map}")
-    print(f"[REM] Saved metrics:        {args.out_metrics_json}")
-    print(f"[REM] Log JSONL:            {args.log_jsonl}")
-    print(f"[REM] Checkpoints:          {args.ckpt_dir}")
+    print(f"[REM] Saved poison map: {args.out_poison_map}")
+    print(f"[REM] Saved metrics: {args.out_metrics_json}")
+    print(f"[REM] Log JSONL: {args.log_jsonl}")
+    print(f"[REM] Checkpoints: {args.ckpt_dir}")
 
 
 if __name__ == "__main__":
